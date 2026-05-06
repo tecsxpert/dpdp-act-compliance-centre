@@ -1,19 +1,12 @@
+# =============================================================================
+# services/chroma_client.py
+# Merged version: Contains AI Dev 2's robust class structure + AI Dev 1's RAG chunking
+# =============================================================================
+
+import logging
 import os
-import chromadb
-from sentence_transformers import SentenceTransformer
 
-# 1. Initialize ChromaDB persistent client
-# This saves the vector data locally so it survives server restarts
-CHROMA_DATA_PATH = os.path.join(os.path.dirname(__file__), '..', 'chroma_data')
-chroma_client = chromadb.PersistentClient(path=CHROMA_DATA_PATH)
-
-# Create or connect to the collection
-collection = chroma_client.get_or_create_collection(name="dpdp_compliance_docs")
-
-# 2. Load the embedding model
-# all-MiniLM-L6-v2 is the standard, fast, and highly efficient sentence-transformer model
-print("Loading embedding model... (this may take a few seconds on first run)")
-embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
+logger = logging.getLogger(__name__)
 
 def chunk_text(text, chunk_size=500, overlap=50):
     """
@@ -32,35 +25,99 @@ def chunk_text(text, chunk_size=500, overlap=50):
         
     return chunks
 
-def ingest_document(doc_id, text, metadata=None):
-    """
-    Chunks a document, generates vector embeddings, and stores them in ChromaDB.
-    """
-    if metadata is None:
-        metadata = {"source": "manual_ingestion"}
+class ChromaClient:
+    def __init__(self):
+        try:
+            import chromadb
+            from sentence_transformers import SentenceTransformer
 
-    # 1. Chunk the text
-    chunks = chunk_text(text, chunk_size=500, overlap=50)
-    
-    # 2. Generate embeddings for all chunks at once
-    embeddings = embedding_model.encode(chunks).tolist()
-    
-    # 3. Prepare IDs and Metadata for each chunk
-    ids = [f"{doc_id}_chunk_{i}" for i in range(len(chunks))]
-    metadatas = [metadata for _ in range(len(chunks))]
-    
-    # 4. Store in ChromaDB
-    collection.add(
-        documents=chunks,
-        embeddings=embeddings,
-        metadatas=metadatas,
-        ids=ids
-    )
-    print(f"Successfully ingested document '{doc_id}' into {len(chunks)} chunks.")
+            # Dev 2's robust initialization
+            self.client = chromadb.PersistentClient(path="./chroma_data")
+            self.collection = self.client.get_or_create_collection("dpdp_compliance_docs")
+            self.model = SentenceTransformer("all-MiniLM-L6-v2")
+            self._available = True
+            logger.info(f"ChromaDB ready — {self.collection.count()} docs loaded")
 
-# --- Quick Test Block ---
+        except ImportError:
+            logger.warning("chromadb / sentence-transformers not installed. ChromaDB disabled.")
+            self._available = False
+            self.collection = _FakeCollection()
+
+        except Exception as e:
+            logger.warning(f"ChromaDB init failed: {e}. Using stub.")
+            self._available = False
+            self.collection = _FakeCollection()
+
+    def ingest_document(self, doc_id: str, text: str, metadata=None):
+        """
+        AI Dev 1's Chunking Ingestion Pipeline.
+        """
+        if not self._available:
+            return
+        if metadata is None:
+            metadata = {"source": "manual_ingestion"}
+
+        try:
+            chunks = chunk_text(text, chunk_size=500, overlap=50)
+            embeddings = self.model.encode(chunks).tolist()
+            
+            ids = [f"{doc_id}_chunk_{i}" for i in range(len(chunks))]
+            metadatas = [metadata for _ in range(len(chunks))]
+            
+            self.collection.add(
+                documents=chunks,
+                embeddings=embeddings,
+                metadatas=metadatas,
+                ids=ids
+            )
+            logger.info(f"Successfully ingested document '{doc_id}' into {len(chunks)} chunks.")
+        except Exception as e:
+            logger.error(f"ChromaDB ingest error: {e}")
+
+    def add_document(self, doc_id: str, text: str):
+        """AI Dev 2's original single-doc add method (kept for compatibility)."""
+        if not self._available:
+            return
+        try:
+            embedding = self.model.encode(text).tolist()
+            self.collection.add(
+                documents=[text],
+                embeddings=[embedding],
+                ids=[doc_id]
+            )
+            logger.info(f"ChromaDB: added doc '{doc_id}'")
+        except Exception as e:
+            logger.error(f"ChromaDB add error: {e}")
+
+    def query(self, question: str, top_k: int = 3) -> list:
+        """AI Dev 2's query method for the /categorise endpoint."""
+        if not self._available:
+            return []
+        try:
+            embedding = self.model.encode(question).tolist()
+            results   = self.collection.query(
+                query_embeddings=[embedding],
+                n_results=min(top_k, max(1, self.collection.count()))
+            )
+            return results["documents"][0] if results["documents"] else []
+        except Exception as e:
+            logger.error(f"ChromaDB query error: {e}")
+            return []
+
+
+class _FakeCollection:
+    """Stub used when ChromaDB is not installed — prevents import errors."""
+    def count(self):
+        return 0
+
+    def add(self, **kwargs):
+        pass
+
+    def query(self, **kwargs):
+        return {"documents": [[]]}
+
+# --- AI Dev 1's Quick Test Block ---
 if __name__ == '__main__':
-    # A dummy DPDP Act rule to test our pipeline
     test_document = (
         "The Digital Personal Data Protection Act (DPDP Act) of India mandates that Data Fiduciaries "
         "must obtain verifiable parental consent before processing any personal data of a child (a person under 18). "
@@ -71,8 +128,7 @@ if __name__ == '__main__':
     )
     
     print("Testing RAG Ingestion Pipeline...")
-    ingest_document(doc_id="dpdp_rule_001", text=test_document, metadata={"category": "children_and_breaches"})
+    client = ChromaClient()
+    client.ingest_document(doc_id="dpdp_rule_001", text=test_document, metadata={"category": "children_and_breaches"})
     
-    # Verify it saved
-    count = collection.count()
-    print(f"Total chunks now stored in ChromaDB: {count}")
+    print(f"Total chunks now stored in ChromaDB: {client.collection.count()}")

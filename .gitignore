@@ -1,7 +1,4 @@
-target/
-node_modules/
-__pycache__/
-chroma_data/
-.env
 venv/
 .env
+chroma_data/
+groq.log
